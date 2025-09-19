@@ -1,0 +1,192 @@
+#!/bin/bash
+
+# ========== DND Automation Script ==========
+LOG_FILE="file name "
+echo -e "\n===== Job Started at $(date '+%F %T') =====" >> "$LOG_FILE"
+
+# ---------- Variables ----------
+S3_BUCKET="bucket name "
+FILENAME="filename"
+S3CMD="path of S3cmd"
+CURRENT_DATE=$(date +%F)
+S3_PATH="$FILENAME"
+LOCAL_FILE="/tmp/dnd_${CURRENT_DATE}.txt"
+OUTPUT_FILE="path for output file to be locally store"
+DB_HOST="local host info"
+DB_USER="db user name "
+DB_PASS="db password"
+DB_NAME="db name "
+DND_DIR="path of directory where the setdndscript located "   #not this automation dnd but the setdbpermanent/criticaldnd.sh script path   onlu path 
+XML_CONFIG="where the temporary dnd xml file located " XML config file with path 
+
+# ---------- Step 1: Download from S3 ----------
+$S3CMD s3 cp "s3://$S3_BUCKET/$S3_PATH" "$LOCAL_FILE" --force
+if [[ $? -ne 0 || ! -s "$LOCAL_FILE" ]]; then
+    echo "❌ Failed to download or empty file: $S3_PATH" >> "$LOG_FILE"
+    exit 1
+fi
+
+echo "📥 Downloaded MSISDNs from S3:"
+cat "$LOCAL_FILE"
+
+# ---------- Init Output File ----------
+> "$OUTPUT_FILE"
+
+# ---------- Step 2: Process MSISDNs ----------
+while IFS=',' read -r raw_msisdn raw_action raw_type || [[ -n "$raw_msisdn" ]]; do
+    msisdn=$(echo "$raw_msisdn" | tr -dc '0-9')
+    action=$(echo "$raw_action" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    type=$(echo "$raw_type" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    [[ -z "$msisdn" ]] && continue
+
+    echo -e "\n\n🔄 Processing MSISDN: $msisdn\n------------------------------------------" | tee -a "$OUTPUT_FILE"
+
+    # ---------- Only STATUS Check ----------
+    if [[ "$action" == "0" && -z "$type" ]]; then
+        FOUND=0
+        for i in {0..9}; do
+            TABLE="tb_subscriptions_$i"
+            QUERY="SELECT status FROM $TABLE WHERE msisdn='$msisdn';"
+            RESULT=$(mysql -h $DB_HOST -u $DB_USER -p$DB_PASS -D $DB_NAME -e "$QUERY" --batch --raw 2>> /path/to/store/mysqlerror.log)
+            if [[ $(echo "$RESULT" | wc -l) -gt 1 ]]; then
+                echo -e "\n📄 Status from $TABLE:\n$RESULT" | tee -a "$OUTPUT_FILE"
+                FOUND=1
+                break
+            fi
+        done
+        [[ "$FOUND" -eq 0 ]] && echo "❌ No subscription status found" | tee -a "$OUTPUT_FILE"
+
+        # ---------- Redis Check ----------
+        REDIS_PID=$(pgrep redis-server | head -n1)
+        REDIS_DIR=$(pwdx "$REDIS_PID" | cut -d ':' -f2 | xargs)
+        if [[ -n "$REDIS_DIR" ]]; then
+            cd "$REDIS_DIR"
+            key_part="${msisdn:0:${#msisdn}-5}"
+            field_part="${msisdn: -5}"
+            DND_STATUS=$(./redis-cli --raw HGET G2_"$key_part" "$field_part")
+            [[ -z "$DND_STATUS" ]] && echo "No Redis DND info" | tee -a "$OUTPUT_FILE"
+            case "$DND_STATUS" in
+                1) echo "✅ Found in Permanent DND" ;;
+                2) echo "✅ Found in Critical DND" ;;
+                3) echo "✅ Found in Both Permanent and Critical DND" ;;
+                *) [[ -n "$DND_STATUS" ]] && echo "⚠️ Unknown DND Code: $DND_STATUS" ;;
+            esac | tee -a "$OUTPUT_FILE"
+        else
+            echo "❌ Redis not running" | tee -a "$OUTPUT_FILE"
+        fi
+
+        # ---------- Temp DND Check ----------
+        if [[ -f "$XML_CONFIG" ]]; then
+            scrub=$(grep -oP '(?<=<blackListScrubWithRedis>).*?(?=</blackListScrubWithRedis>)' "$XML_CONFIG")
+            days=$(grep -oP '(?<=<blackListNoDaysUnsub>).*?(?=</blackListNoDaysUnsub>)' "$XML_CONFIG")
+            if [[ "$scrub" == "Y" && "$days" =~ ^[0-9]+$ ]]; then
+                for i in {0..9}; do
+                    unsub_query="SELECT last_update_ts FROM tb_subscriptions_$i WHERE msisdn='$msisdn' AND last_status='UNSUBSCRIBED';"
+                    ts=$(mysql -h $DB_HOST -u $DB_USER -p$DB_PASS -D $DB_NAME -e "$unsub_query" --batch --raw | tail -n 1)
+                    if [[ "$ts" != "" ]]; then
+                        ts_sec=$(date -d "$ts" +%s)
+                        now_sec=$(date +%s)
+                        diff=$(( (now_sec - ts_sec) / 86400 ))
+                        [[ "$diff" -le "$days" ]] && {
+                            echo "🟡 TEMP DND Detected ($diff days ago)" | tee -a "$OUTPUT_FILE"
+                            break
+                        }
+                    fi
+                done
+            fi
+        fi
+        continue
+    fi
+
+    # ---------- Add/Delete DND ----------
+    echo "➡️ Action: $action | Type: $type" | tee -a "$OUTPUT_FILE"
+    case "$action-$type" in
+        add-permanent)
+            echo "$msisdn" > "$DND_DIR/ADDFILE/${CURRENT_DATE}.txt"
+            export FILE_PATH="$DND_DIR/${CURRENT_DATE}.txt"
+            (cd "$DND_DIR" && ./setRedisDb_PermanentBlacklist.sh)
+            echo "✅ Added to Permanent DND" ;;
+        add-critical)
+            echo "$msisdn" > "$DND_DIR/${CURRENT_DATE}.txt"
+            export FILE_PATH="$DND_DIR/${CURRENT_DATE}.txt"
+            (cd "$DND_DIR" && ./setRedisDb_CriticalBlacklist.sh)
+            echo "✅ Added to Critical DND" ;;
+        delete-permanent)
+            echo "$msisdn" > "$DND_DIR/${CURRENT_DATE}.txt"
+            export FILE_PATH="$DND_DIR/${CURRENT_DATE}.txt"
+            (cd "$DND_DIR" && ./setdnd.sh)                 #script that add the number into dnd
+            echo "✅ Removed from Permanent DND" ;;
+        delete-critical)
+            echo "$msisdn" > "$DND_DIR/${CURRENT_DATE}.txt"
+            export FILE_PATH="$DND_DIR/${CURRENT_DATE}.txt"
+            (cd "$DND_DIR" && ./deleteRedisDb_CriticalBlacklist.sh)   #script that add the number into dnd
+            echo "✅ Removed from Critical DND" ;;
+        *) echo "❌ Invalid Action-Type" ;;
+    esac | tee -a "$OUTPUT_FILE"
+
+    # ---------- Subscription Info ----------
+    # ---------- Subscription Info ----------
+digit="${msisdn: -1}"
+sub_table="tb_subscriptions_$digit"
+sub_query="SELECT operator_id, msisdn, content_id, service, status, renewal_ts, last_update_ts, subscription_ts FROM $sub_table WHERE msisdn='$msisdn';"
+sub_result=$(mysql -h $DB_HOST -u $DB_USER -p$DB_PASS -D $DB_NAME -e "$sub_query" --batch --raw)
+if [[ $(echo "$sub_result" | wc -l) -gt 1 ]]; then
+    echo -e "\n===== SUBSCRIPTION ($sub_table) =====" | tee -a "$OUTPUT_FILE"
+    echo "$sub_result" | tee -a "$OUTPUT_FILE"
+else
+    echo "No subscription data found in $sub_table." | tee -a "$OUTPUT_FILE"
+fi
+
+# ---------- Renewal Info ----------
+renew_query="SELECT msisdn, operator_id, content_id, last_status, renewal_ts, last_update_ts FROM tb_renewal WHERE msisdn='$msisdn';"
+renew_result=$(mysql -h $DB_HOST -u $DB_USER -p$DB_PASS -D $DB_NAME -e "$renew_query" --batch --raw)
+if [[ $(echo "$renew_result" | wc -l) -gt 1 ]]; then
+    echo -e "\n===== RENEWAL DETAILS =====" | tee -a "$OUTPUT_FILE"
+    echo "$renew_result" | tee -a "$OUTPUT_FILE"
+else
+    echo "No renewal data found." | tee -a "$OUTPUT_FILE"
+fi
+
+# ---------- History Info ----------
+hist_table="tb_subscription_history_$digit"
+hist_query="SELECT operator_id, msisdn, content_id, request_ts, request, channel FROM $hist_table WHERE msisdn='$msisdn';"
+hist_result=$(mysql -h $DB_HOST -u $DB_USER -p$DB_PASS -D $DB_NAME -e "$hist_query" --batch --raw)
+if [[ $(echo "$hist_result" | wc -l) -gt 1 ]]; then
+    echo -e "\n===== HISTORY ($hist_table) =====" | tee -a "$OUTPUT_FILE"
+    echo "$hist_result" | tee -a "$OUTPUT_FILE"
+else
+    echo "No history data found in $hist_table." | tee -a "$OUTPUT_FILE"
+fi
+
+
+done < "$LOCAL_FILE"
+
+# ---------- Step 3: Email ----------
+EMAIL="xxx.xxx xxx.xxxx xxx.xxx xxxxxxx.xxx" 
+MAIL_BODY="/tmp/mail_body.txt"
+{
+  echo "Subject: MSISDN DND Report "
+  echo "To: $EMAIL"
+  echo "From: NOC<youremail>"
+  echo "MIME-Version: XX"
+  echo "Content-Type: text/plain"
+  echo
+  echo "Hi Team,"
+  echo
+  echo "Please find the MSISDN DND Report for ATOM MAYANMAR"
+  echo
+  cat "$OUTPUT_FILE"
+  echo
+  echo "Regards,"
+  echo "NOC Team"
+} > "$MAIL_BODY"
+
+sendmail -t < "$MAIL_BODY"
+echo "📤 Email sent successfully to $EMAIL"
+---------- Step 7: Optionally Delete from S3 ----------
+ $S3CMD s3 rm "s3://$S3_BUCKET/$S3_PATH"
+ if [ $? -eq 0 ]; then
+    echo "🗑️ Deleted $S3_PATH from S3 after successful processing." >> "$OUTPUT_FILE"
+ else
+   echo "⚠️ Failed to delete $S3_PATH from S3." >> "$OUTPUT_FILE"
+ fi
